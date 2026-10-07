@@ -1,11 +1,12 @@
 # Runbook: deploy and operate the pipeline
 
-A self-directed ETL project: lands NYC 311 Service Requests data (historical + a live daily incremental feed) into an S3 raw zone on AWS. See `Docs/Architecture.md` for the technical design and `Docs/decisionlog.md` for why things ended up the way they did — this file is just the practical "how do I run this" reference.
+A self-directed ETL project: lands NYC 311 Service Requests data (historical + a live daily incremental feed) in S3, cleans it into a queryable table with Glue, and publishes summary tables with Athena. See `Docs/Architecture.md` for the technical design and `Docs/decisionlog.md` for why things ended up the way they did — this file is just the practical "how do I run this" reference.
 
 ## Prerequisites
 
 - **AWS CLI v2** installed and on your PATH (`aws --version`).
-- **Python 3.12+** installed (`python --version`).
+- **Python 3.12+** installed (`python --version`), plus `boto3` (`pip install boto3`), which the helper scripts use.
+- **Windows + Git Bash only:** put `MSYS_NO_PATHCONV=1` in front of any AWS command whose argument starts with `/` (for example the SSM parameter name below). Otherwise Git Bash rewrites the path and the command fails.
 - **AWS credentials configured** for the account you want to deploy into:
   ```
   aws configure
@@ -23,7 +24,7 @@ A self-directed ETL project: lands NYC 311 Service Requests data (historical + a
 aws cloudformation deploy --template-file infra/template.yaml --stack-name nyc311-etl --capabilities CAPABILITY_IAM
 ```
 
-This creates (or updates) everything in one shot: the S3 bucket, the incremental Lambda (code embedded directly in the template — see `Docs/Architecture.md` §5), the daily EventBridge schedule, the IAM role, and the SSM watermark parameter (seeded to `2025-03-31T23:59:59.000`).
+This creates (or updates) everything in one shot: the S3 bucket, the incremental Lambda (code embedded directly in the template — see `Docs/Architecture.md` §5), the daily EventBridge schedule (created **disabled** — see Scope notes), the IAM role, and the SSM watermark parameter (seeded to `2025-03-31T23:59:59.000`).
 
 Confirm it succeeded and get the bucket/function names:
 ```
@@ -58,7 +59,7 @@ aws ssm get-parameter --name /nyc311-etl/incremental/watermark --query "Paramete
 
 ## Verifying it's actually running unattended
 
-The EventBridge rule fires daily at **6:00 AM UTC** with zero manual involvement needed after that. To confirm it's actually working on its own (don't just assume):
+Once the schedule is enabled (it ships `DISABLED` — see Scope notes), the EventBridge rule fires daily at **6:00 AM UTC** with no manual involvement. To confirm it's actually working on its own (don't just assume):
 
 ```
 aws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Invocations \
@@ -89,12 +90,16 @@ You should see roughly one invocation per day. Also spot-check S3 for new files 
    ```
    MSCK REPAIR TABLE nyc311_curated
    ```
+   or from the command line:
+   ```
+   aws athena start-query-execution --query-string "MSCK REPAIR TABLE nyc311_curated" --query-execution-context Database=nyc311_db --work-group nyc311-workgroup
+   ```
 5. Run the data-quality ruleset (the role ARN is in the stack outputs):
    ```
    aws glue start-data-quality-ruleset-evaluation-run --data-source '{"GlueTable":{"DatabaseName":"nyc311_db","TableName":"nyc311_curated"}}' --role <GlueServiceRoleArn> --ruleset-names nyc311-curated-ruleset
    ```
 
-Optionally run the three crawlers (`nyc311-historical-csv-crawler`, `nyc311-historical-api-backfill-crawler`, `nyc311-incremental-crawler`) to register the raw tables in the Glue Data Catalog for ad-hoc Athena queries on raw data.
+Optionally run the three crawlers (`nyc311-historical-csv-crawler`, `nyc311-historical-api-backfill-crawler`, `nyc311-incremental-crawler`) to register the raw tables in the Glue Data Catalog for ad-hoc Athena queries on raw data. Note: `nyc311-historical-api-backfill-crawler` only applies if the folder `raw/311/historical/api_backfill_2025-04-01_to_2026-08-02/` exists. In the original build it was created by moving the first catch-up output there; on a fresh deployment the catch-up lands in `raw/311/incremental/` instead. The transform job reads both locations, so nothing else is needed.
 
 ## Scope notes
 
