@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NYC 311 ETL Phase 2 - Glue Data Catalog, crawlers, and Athena workgroup for
+  transforming raw S3 data into a cleaned, queryable curated table.
+
+Parameters:
+  RawBucketName:
+    Type: String
+    Description: Name of the existing Phase 1 S3 bucket (from the nyc311-etl stack's BucketName output).
+  HistoricalCsvFileName:
+    Type: String
+    Default: NYC_Data_From_jan1st_2025_to_mar31st_2025.csv
+  ApiBackfillPrefix:
+    Type: String
+    Default: api_backfill_2025-04-01_to_2026-08-02
+
+Resources:
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: nyc311_db
+        Description: NYC 311 ETL Phase 2 - raw and curated table definitions.
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole"
+      Policies:
+        - PolicyName: NYC311GlueDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${RawBucketName}/raw/311/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${RawBucketName}/curated/311/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${RawBucketName}/athena-results/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${RawBucketName}/glue-scripts/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${RawBucketName}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "raw/311/*"
+                      - "curated/311/*"
+                      - "athena-results/*"
+                      - "glue-scripts/*"
+              - Effect: Allow
+                Action:
+                  - glue:StartDataQualityRulesetEvaluationRun
+                  - glue:GetDataQualityRulesetEvaluationRun
+                  - glue:CreateDataQualityRuleset
+                  - glue:GetDataQualityRuleset
+                  - glue:GetDataQualityResult
+                Resource: "*"
+
+  CrawlerHistoricalCsv:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: nyc311-historical-csv-crawler
+      DatabaseName: !Ref GlueDatabase
+      Role: !GetAtt GlueServiceRole.Arn
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawBucketName}/raw/311/historical/"
+            Exclusions:
+              - !Sub "${ApiBackfillPrefix}/**"
+      TablePrefix: ""
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CrawlerHistoricalApiBackfill:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: nyc311-historical-api-backfill-crawler
+      DatabaseName: !Ref GlueDatabase
+      Role: !GetAtt GlueServiceRole.Arn
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawBucketName}/raw/311/historical/${ApiBackfillPrefix}/"
+      TablePrefix: ""
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CrawlerIncremental:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: nyc311-incremental-crawler
+      DatabaseName: !Ref GlueDatabase
+      Role: !GetAtt GlueServiceRole.Arn
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${RawBucketName}/raw/311/incremental/"
+      TablePrefix: ""
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  CuratedTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: nyc311_curated
+        Description: Cleaned, deduplicated, unified NYC 311 data - written by the Phase 2 transform job.
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${RawBucketName}/curated/311/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - { Name: unique_key, Type: string }
+            - { Name: created_date, Type: timestamp }
+            - { Name: closed_date, Type: timestamp }
+            - { Name: agency, Type: string }
+            - { Name: agency_name, Type: string }
+            - { Name: complaint_type, Type: string }
+            - { Name: descriptor, Type: string }
+            - { Name: descriptor_2, Type: string }
+            - { Name: additional_details, Type: string }
+            - { Name: location_type, Type: string }
+            - { Name: incident_zip, Type: string }
+            - { Name: incident_address, Type: string }
+            - { Name: street_name, Type: string }
+            - { Name: cross_street_1, Type: string }
+            - { Name: cross_street_2, Type: string }
+            - { Name: intersection_street_1, Type: string }
+            - { Name: intersection_street_2, Type: string }
+            - { Name: address_type, Type: string }
+            - { Name: city, Type: string }
+            - { Name: landmark, Type: string }
+            - { Name: facility_type, Type: string }
+            - { Name: status, Type: string }
+            - { Name: due_date, Type: timestamp }
+            - { Name: resolution_description, Type: string }
+            - { Name: resolution_action_updated_date, Type: timestamp }
+            - { Name: community_board, Type: string }
+            - { Name: council_district, Type: string }
+            - { Name: police_precinct, Type: string }
+            - { Name: bbl, Type: string }
+            - { Name: borough, Type: string }
+            - { Name: x_coordinate_state_plane, Type: double }
+            - { Name: y_coordinate_state_plane, Type: double }
+            - { Name: open_data_channel_type, Type: string }
+            - { Name: park_facility_name, Type: string }
+            - { Name: park_borough, Type: string }
+            - { Name: vehicle_type, Type: string }
+            - { Name: taxi_company_borough, Type: string }
+            - { Name: taxi_pick_up_location, Type: string }
+            - { Name: bridge_highway_name, Type: string }
+            - { Name: bridge_highway_direction, Type: string }
+            - { Name: road_ramp, Type: string }
+            - { Name: bridge_highway_segment, Type: string }
+            - { Name: latitude, Type: double }
+            - { Name: longitude, Type: double }
+            - { Name: source, Type: string }
+
+  TransformJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: nyc311-transform-job
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: "3.0"
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${RawBucketName}/glue-scripts/clean_and_unify.py"
+      DefaultArguments:
+        "--BUCKET_NAME": !Ref RawBucketName
+        "--library-set": analytics
+      MaxCapacity: 1
+      Timeout: 60
+
+  CuratedDataQualityRuleset:
+    Type: AWS::Glue::DataQualityRuleset
+    Properties:
+      Name: nyc311-curated-ruleset
+      Description: Regression checks for nyc311_curated, grounded in actually-measured values (Docs/decisionlog.md #25).
+      TargetTable:
+        DatabaseName: !Ref GlueDatabase
+        TableName: !Ref CuratedTable
+      Ruleset: >-
+        Rules = [
+          RowCount > 6000000,
+          ColumnCount = 47,
+          IsUnique "unique_key",
+          Completeness "unique_key" > 0.99,
+          Completeness "created_date" > 0.99,
+          Completeness "borough" > 0.85
+        ]
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: nyc311-workgroup
+      Description: Workgroup for querying the NYC 311 Glue Data Catalog tables.
+      WorkGroupConfiguration:
+        # Off so gold-layer CTAS queries can write to their own gold/311/ locations.
+        EnforceWorkGroupConfiguration: false
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${RawBucketName}/athena-results/"
+
+Outputs:
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+  GlueServiceRoleArn:
+    Value: !GetAtt GlueServiceRole.Arn
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup

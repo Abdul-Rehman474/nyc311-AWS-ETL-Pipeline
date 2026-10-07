@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NYC 311 ETL Phase 1 - raw S3 zone, incremental Lambda (urllib + boto3 only),
+  EventBridge daily schedule, SSM watermark parameter.
+
+Resources:
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  WatermarkParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nyc311-etl/incremental/watermark
+      Type: String
+      Value: "2025-03-31T23:59:59.000"
+      Description: Last successfully processed created_date watermark for the incremental Lambda.
+
+  IncrementalLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: IncrementalLambdaInlinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${RawDataBucket.Arn}/raw/311/incremental/*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${WatermarkParameter}"
+
+  IncrementalLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: nyc311-incremental-loader
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IncrementalLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref RawDataBucket
+          WATERMARK_PARAM_NAME: !Ref WatermarkParameter
+          SOCRATA_DATASET_ID: erm2-nwe9
+          MAX_PAGES_PER_RUN: "1"
+      Code:
+        ZipFile: |
+          import datetime
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          import boto3
+
+          BUCKET_NAME = os.environ["BUCKET_NAME"]
+          WATERMARK_PARAM_NAME = os.environ["WATERMARK_PARAM_NAME"]
+          SOCRATA_DATASET_ID = os.environ["SOCRATA_DATASET_ID"]
+          MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "5"))
+
+          PAGE_SIZE = 50000
+          SOCRATA_URL = f"https://data.cityofnewyork.us/resource/{SOCRATA_DATASET_ID}.json"
+
+          ssm = boto3.client("ssm")
+          s3 = boto3.client("s3")
+
+
+          def fetch_page(watermark, offset):
+              query = {
+                  "$where": f"created_date > '{watermark}'",
+                  "$order": "created_date ASC",
+                  "$limit": PAGE_SIZE,
+                  "$offset": offset,
+              }
+              url = f"{SOCRATA_URL}?{urllib.parse.urlencode(query)}"
+              with urllib.request.urlopen(url, timeout=60) as response:
+                  return json.loads(response.read())
+
+
+          def handler(event, context):
+              watermark = ssm.get_parameter(Name=WATERMARK_PARAM_NAME)["Parameter"]["Value"]
+              max_created = watermark
+              all_records = []
+              pages_fetched = 0
+
+              for page in range(MAX_PAGES_PER_RUN):
+                  rows = fetch_page(watermark, page * PAGE_SIZE)
+                  pages_fetched += 1
+                  if not rows:
+                      break
+                  all_records.extend(rows)
+                  last_created = rows[-1].get("created_date")
+                  if last_created:
+                      max_created = last_created
+                  if len(rows) < PAGE_SIZE:
+                      break
+
+              if all_records:
+                  run_ts = datetime.datetime.now(datetime.UTC)
+                  key = (
+                      f"raw/311/incremental/year={run_ts:%Y}/month={run_ts:%m}/day={run_ts:%d}/"
+                      f"batch_{run_ts:%H%M%S}.json"
+                  )
+                  body = "\n".join(json.dumps(record) for record in all_records)
+                  s3.put_object(Bucket=BUCKET_NAME, Key=key, Body=body.encode("utf-8"))
+                  ssm.put_parameter(
+                      Name=WATERMARK_PARAM_NAME,
+                      Value=max_created,
+                      Type="String",
+                      Overwrite=True,
+                  )
+
+              return {
+                  "records_pulled": len(all_records),
+                  "pages_fetched": pages_fetched,
+                  "watermark_advanced_to": max_created,
+              }
+
+  IncrementalScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Triggers the NYC 311 incremental Lambda daily at 6am UTC. Disabled 2026-09-09 to stop ongoing cost/growth while working on Phase 2 against a frozen data snapshot — see decisionlog.md #22.
+      ScheduleExpression: cron(0 6 * * ? *)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt IncrementalLambdaFunction.Arn
+          Id: IncrementalLambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IncrementalLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IncrementalScheduleRule.Arn
+
+Outputs:
+  BucketName:
+    Description: Raw zone S3 bucket name.
+    Value: !Ref RawDataBucket
+  LambdaFunctionName:
+    Description: Incremental Lambda function name (for aws lambda invoke).
+    Value: !Ref IncrementalLambdaFunction
